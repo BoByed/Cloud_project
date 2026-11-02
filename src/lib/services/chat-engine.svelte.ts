@@ -1,0 +1,1166 @@
+// ============================================================================
+// Reactive Sync & Recovery Engine (Svelte 5 Runes)
+// Coordinates HTTP Client, WebSocket Client (chat.v1), and IndexedDB Storage
+// Implements Section 4 (Idempotent Outbox) and Section 6 (Contiguous Recovery)
+// ============================================================================
+
+import type {
+  Message,
+  PendingMessage,
+  Room,
+  SessionInfo,
+  UserSummary
+} from '../types/contract.js';
+import {
+  compareSeq,
+  generateUuid,
+  parseSeq,
+  validateMessageText
+} from '../types/contract.js';
+import {
+  clearUserPendingData,
+  getAllPendingForUser,
+  initStorage,
+  loadRoomState,
+  removePendingSend,
+  saveMessagesAndCursorAtomic,
+  savePendingSend
+} from '../storage/indexeddb.js';
+import { ApiError, httpClient } from './http-client.js';
+import { wsClient, type WsState } from './ws-client.js';
+
+export interface LogEntry {
+  id: string;
+  time: string;
+  type: 'info' | 'ws' | 'sync' | 'http' | 'error';
+  text: string;
+}
+
+export class ChatEngine {
+  // Reactive State (Svelte 5 Runes)
+  session: SessionInfo | null = $state(null);
+  devUsers: UserSummary[] = $state([]);
+  authLoading: boolean = $state(true);
+  authError: string | null = $state(null);
+  storageDegraded: boolean = $state(false);
+
+  rooms: Room[] = $state([]);
+  roomsNextCursor: string | null = $state(null);
+  loadingMoreRooms: boolean = $state(false);
+  activeRoomId: string | null = $state(null);
+  messagesByRoom: Record<string, Message[]> = $state({});
+  pendingByRoom: Record<string, PendingMessage[]> = $state({});
+  cursorByRoom: Record<string, string> = $state({});
+  subscribedRooms: Record<string, boolean> = $state({});
+  revokedRooms: Record<string, string> = $state({});
+
+  historyHasMoreByRoom: Record<string, boolean> = $state({});
+  historyNextBeforeSeqByRoom: Record<string, string | null> = $state({});
+  loadingHistory: boolean = $state(false);
+  syncingByRoom: Record<string, boolean> = $state({});
+
+  wsState: WsState = $state('disconnected');
+  wsError: string | null = $state(null);
+  lastCloseCode: number | null = $state(null);
+  reconnectAttempt: number = $state(0);
+
+  simulateTimeoutOnSend: boolean = $state(false);
+  workerPaused: boolean = $state(false);
+  outboxBacklogCount: number = $state(0);
+  eventLog: LogEntry[] = $state([]);
+
+  // Internal live event buffer during active HTTP sync / room subscribe (max 500 events per room)
+  private liveBuffer: Record<string, Message[]> = {};
+  public bufferingRoomIds: Record<string, boolean> = {};
+  private simulatedDroppedIds = new Set<string>();
+  private periodicSyncTimer: ReturnType<typeof setInterval> | null = null;
+  private isVisibilityListenerAttached = false;
+
+  constructor() {
+    this.setupWsCallbacks();
+  }
+
+  // Getters & Derived helpers
+  get activeRoom(): Room | null {
+    if (!this.activeRoomId) return null;
+    return this.rooms.find((r) => r.room_id === this.activeRoomId) ?? null;
+  }
+
+  get activeMessages(): Message[] {
+    if (!this.activeRoomId) return [];
+    return this.messagesByRoom[this.activeRoomId] ?? [];
+  }
+
+  get activePending(): PendingMessage[] {
+    if (!this.activeRoomId) return [];
+    return this.pendingByRoom[this.activeRoomId] ?? [];
+  }
+
+  get activeCursor(): string {
+    if (!this.activeRoomId) return '0';
+    return this.cursorByRoom[this.activeRoomId] ?? '0';
+  }
+
+  public addLog(type: LogEntry['type'], text: string): void {
+    const entry: LogEntry = {
+      id: generateUuid(),
+      time: new Date().toLocaleTimeString(),
+      type,
+      text
+    };
+    this.eventLog = [entry, ...this.eventLog.slice(0, 99)];
+  }
+
+  /**
+   * Initializes the engine: loads storage, dev users, verifies current session,
+   * restores pending outbox sends, and sets up sync timers.
+   */
+  public async initialize(): Promise<void> {
+    this.authLoading = true;
+    this.authError = null;
+
+    try {
+      // 1. Initialize IndexedDB storage
+      const storageInit = await initStorage();
+      this.storageDegraded = storageInit.degraded;
+      if (storageInit.degraded) {
+        this.addLog('info', 'IndexedDB unavailable; operating in degraded in-memory mode.');
+      } else {
+        this.addLog('info', 'IndexedDB (cloud_chat_v1) initialized.');
+      }
+
+      // 2. Fetch mock dev users for local demo switching
+      try {
+        this.devUsers = await httpClient.fetchDevUsers();
+      } catch (err) {
+        this.addLog('error', `Could not fetch dev users: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      // 3. Check current authentication session
+      try {
+        const session = await httpClient.fetchSession();
+        this.session = session;
+        this.addLog('info', `Session verified for user ${session.user.display_name} (${session.user.user_id})`);
+        await this.onLoginSuccess();
+      } catch {
+        // Not logged in or expired session
+        this.session = null;
+        this.addLog('info', 'No active user session. Please log in.');
+      }
+    } catch (err) {
+      this.authError = err instanceof Error ? err.message : 'Engine initialization failed';
+      this.addLog('error', `Init error: ${this.authError}`);
+    } finally {
+      this.authLoading = false;
+    }
+
+    this.setupVisibilityListener();
+  }
+
+  /**
+   * Logs in using one of the mock dev users.
+   */
+  public async loginWithDevUser(userId: string): Promise<void> {
+    this.authLoading = true;
+    this.authError = null;
+    try {
+      const session = await httpClient.devLogin(userId);
+      this.session = session;
+      this.addLog('info', `Logged in as ${session.user.display_name} (${session.user.user_id})`);
+      await this.onLoginSuccess();
+    } catch (err) {
+      this.authError = err instanceof Error ? err.message : 'Dev login failed';
+      this.addLog('error', `Dev login error: ${this.authError}`);
+    } finally {
+      this.authLoading = false;
+    }
+  }
+
+  /**
+   * Redirects to the AWS Cognito OAuth2 login route.
+   */
+  public loginWithCognitoRedirect(): void {
+    window.location.href = '/auth/login';
+  }
+
+  /**
+   * Logs out from this device or all devices.
+   */
+  public async logout(allDevices = false): Promise<void> {
+    const userId = this.session?.user.user_id;
+    try {
+      await httpClient.logout(allDevices);
+    } catch (err) {
+      console.warn('Logout request failed:', err);
+    }
+
+    if (userId) {
+      try {
+        await clearUserPendingData(userId);
+      } catch (err) {
+        console.warn('Failed to clear user pending data:', err);
+      }
+    }
+
+    this.stopPeriodicSync();
+    wsClient.disconnect();
+
+    this.session = null;
+    this.rooms = [];
+    this.roomsNextCursor = null;
+    this.loadingMoreRooms = false;
+    this.activeRoomId = null;
+    this.messagesByRoom = {};
+    this.pendingByRoom = {};
+    this.cursorByRoom = {};
+    this.subscribedRooms = {};
+    this.revokedRooms = {};
+    this.historyHasMoreByRoom = {};
+    this.historyNextBeforeSeqByRoom = {};
+    this.syncingByRoom = {};
+    this.liveBuffer = {};
+    this.bufferingRoomIds = {};
+    this.workerPaused = false;
+    this.outboxBacklogCount = 0;
+
+    this.addLog('info', allDevices ? 'Logged out from all devices.' : 'Logged out from this device.');
+  }
+
+  /**
+   * Paginates the rooms list using next_cursor (Gap F9).
+   */
+  public async loadMoreRooms(): Promise<void> {
+    if (!this.session || this.loadingMoreRooms || !this.roomsNextCursor) return;
+    this.loadingMoreRooms = true;
+    try {
+      this.addLog('http', `Loading more rooms (cursor: ${this.roomsNextCursor})...`);
+      const resp = await httpClient.fetchRooms(50, this.roomsNextCursor);
+      const newRooms = resp.items || [];
+      const existingIds = new Set(this.rooms.map((r) => r.room_id));
+      const toAdd = newRooms.filter((r) => !existingIds.has(r.room_id));
+      this.rooms = [...this.rooms, ...toAdd];
+      this.roomsNextCursor = resp.next_cursor ?? null;
+      this.addLog('http', `Loaded ${toAdd.length} more rooms (next_cursor: ${this.roomsNextCursor ?? 'none'})`);
+    } catch (err) {
+      this.addLog('error', `Failed to load more rooms: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.loadingMoreRooms = false;
+    }
+  }
+
+  /**
+   * Selects an active chat room, loading local state from IDB, subscribing over WS (awaiting 'subscribed' frame),
+   * and initiating background recovery sync (Gap F1, F5).
+   */
+  public async selectRoom(roomId: string): Promise<void> {
+    if (!this.session) return;
+    this.activeRoomId = roomId;
+
+    const userId = this.session.user.user_id;
+
+    // 1. Load stored messages, cursor, and pending outbox for this room from IDB
+    const local = await loadRoomState(userId, roomId);
+
+    // Gap F5: Reload during sending/pending -> Restore as failed_retryable with same client_message_id
+    for (const p of local.pending) {
+      if (p.status === 'sending' || p.status === 'pending') {
+        p.status = 'failed_retryable';
+        p.error_code = 'RELOAD_INTERRUPTED';
+        p.error_message = 'โหลดหน้าใหม่ระหว่างรอผล — กดส่งซ้ำด้วยรหัสเดิม';
+        await savePendingSend(p);
+      }
+    }
+
+    this.messagesByRoom[roomId] = local.messages;
+    this.cursorByRoom[roomId] = local.contiguousSeq;
+    this.pendingByRoom[roomId] = local.pending;
+
+    this.addLog(
+      'info',
+      `Opened room ${roomId}: loaded ${local.messages.length} messages (Cursor: #${local.contiguousSeq}, Pending: ${local.pending.length})`
+    );
+
+    // 2. Gap F1: Enable live buffering BEFORE awaiting subscribe confirmation
+    this.bufferingRoomIds[roomId] = true;
+    this.liveBuffer[roomId] = this.liveBuffer[roomId] || [];
+
+    const subLastSeq = await wsClient.subscribeRoom(roomId);
+    this.subscribedRooms[roomId] = true;
+    if (subLastSeq) {
+      this.addLog('ws', `Subscribed to room ${roomId} (last_seq: #${subLastSeq})`);
+    }
+
+    // 3. Run recovery sync per Section 6 (which merges liveBuffer and clears buffering)
+    await this.syncRoom(roomId);
+
+    // 4. If room has no messages yet, attempt initial history load
+    if ((this.messagesByRoom[roomId]?.length ?? 0) === 0) {
+      await this.loadOlderHistory(roomId);
+    }
+  }
+
+  /**
+   * Loads older message history older than before_seq.
+   * Section 4 requirement: Message history paging does NOT advance the contiguous recovery cursor.
+   */
+  public async loadOlderHistory(roomId?: string): Promise<void> {
+    const targetRoomId = roomId ?? this.activeRoomId;
+    if (!targetRoomId || !this.session || this.loadingHistory) return;
+    if (this.historyHasMoreByRoom[targetRoomId] === false) return;
+
+    this.loadingHistory = true;
+    try {
+      const beforeSeq = this.historyNextBeforeSeqByRoom[targetRoomId] ?? null;
+      this.addLog('http', `Loading history for room ${targetRoomId} (before_seq: ${beforeSeq ?? 'latest'})...`);
+
+      const resp = await httpClient.fetchRoomHistory(targetRoomId, 50, beforeSeq);
+      this.historyHasMoreByRoom[targetRoomId] = resp.has_more;
+      this.historyNextBeforeSeqByRoom[targetRoomId] = resp.next_before_seq;
+
+      if (resp.items && resp.items.length > 0) {
+        const existing = this.messagesByRoom[targetRoomId] || [];
+        const merged = this.dedupAndSortMessages([...resp.items, ...existing]);
+        this.messagesByRoom[targetRoomId] = merged;
+
+        // Save history messages to storage without altering contiguousSeq
+        const cursor = this.cursorByRoom[targetRoomId] || '0';
+        await saveMessagesAndCursorAtomic(this.session.user.user_id, targetRoomId, merged, cursor);
+        this.addLog('http', `Loaded ${resp.items.length} older messages (has_more: ${resp.has_more})`);
+      }
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 404 || err.code === 'ROOM_NOT_FOUND')) {
+        this.handleRoomRevoked(targetRoomId, 'ROOM_NOT_FOUND');
+      }
+      this.addLog('error', `Failed to load history: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.loadingHistory = false;
+    }
+  }
+
+  /**
+   * Implements Section 6 Steps 2–5 Contiguous Recovery Protocol:
+   * 1. Reads local contiguous cursor.
+   * 2. Loops GET /api/v1/rooms/{id}/sync locking through_seq from page 1.
+   * 3. Merges HTTP items with live event buffer.
+   * 4. Deduplicates by message_id and sorts by BigInt(seq).
+   * 5. Advances contiguous_seq while seq === cursor + 1n.
+   * 6. Atomically saves messages + cursor in IndexedDB.
+   */
+  public async syncRoom(roomId: string): Promise<void> {
+    if (!this.session || this.syncingByRoom[roomId]) return;
+
+    this.syncingByRoom[roomId] = true;
+    this.addLog('sync', `Starting recovery sync for room ${roomId}...`);
+
+    try {
+      const userId = this.session.user.user_id;
+      let currentCursor = this.cursorByRoom[roomId] || '0';
+      let lockedThroughSeq: string | null = null;
+      let hasMore = true;
+      let nextAfterSeq = currentCursor;
+      const httpItems: Message[] = [];
+
+      // Drain and lock live events arriving while sync is actively fetching
+      this.liveBuffer[roomId] = this.liveBuffer[roomId] || [];
+
+      while (hasMore) {
+        const resp = await httpClient.fetchRoomSync(
+          roomId,
+          nextAfterSeq,
+          lockedThroughSeq,
+          100
+        );
+
+        if (!lockedThroughSeq && resp.through_seq) {
+          lockedThroughSeq = resp.through_seq;
+        }
+
+        if (resp.items && resp.items.length > 0) {
+          httpItems.push(...resp.items);
+        }
+
+        hasMore = resp.has_more;
+        nextAfterSeq = resp.next_after_seq;
+
+        // Safety break if server reports next_after_seq <= currentCursor
+        if (hasMore && compareSeq(nextAfterSeq, currentCursor) <= 0) {
+          break;
+        }
+      }
+
+      // Merge HTTP items + buffered live WebSocket events
+      const bufferedEvents = this.liveBuffer[roomId] || [];
+      this.liveBuffer[roomId] = [];
+      this.bufferingRoomIds[roomId] = false;
+
+      const currentMessages = this.messagesByRoom[roomId] || [];
+      const combined = [...currentMessages, ...httpItems, ...bufferedEvents];
+      const dedupedAndSorted = this.dedupAndSortMessages(combined);
+      this.messagesByRoom[roomId] = dedupedAndSorted;
+
+      // Advance contiguous cursor:
+      // While there are messages starting at cursor + 1n with no missing seq gap,
+      // advance contiguous_seq.
+      let newCursorBig = parseSeq(currentCursor);
+      for (const msg of dedupedAndSorted) {
+        const msgSeq = parseSeq(msg.seq);
+        if (msgSeq === newCursorBig + 1n) {
+          newCursorBig = msgSeq;
+        } else if (msgSeq > newCursorBig + 1n) {
+          // Sequence gap encountered! Stop advancing cursor per Section 6 Rule 5.
+          break;
+        }
+      }
+
+      const finalCursor = newCursorBig.toString();
+      this.cursorByRoom[roomId] = finalCursor;
+
+      // Reconcile pending outbox sends with confirmed messages
+      await this.reconcilePendingSends(roomId, dedupedAndSorted);
+
+      // Save atomically in IndexedDB
+      await saveMessagesAndCursorAtomic(userId, roomId, dedupedAndSorted, finalCursor);
+
+      this.addLog(
+        'sync',
+        `Sync completed for room ${roomId}: ${httpItems.length} HTTP items + ${bufferedEvents.length} live buffered. Contiguous cursor is now #${finalCursor}.`
+      );
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 404 || err.code === 'ROOM_NOT_FOUND')) {
+        this.handleRoomRevoked(roomId, 'ROOM_NOT_FOUND');
+      }
+      this.addLog('error', `Sync failed for room ${roomId}: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.syncingByRoom[roomId] = false;
+      this.bufferingRoomIds[roomId] = false;
+    }
+  }
+
+  /**
+   * Validates text, generates client_message_id, stores in pending_sends in IDB,
+   * fires HTTP POST, reconciles with live WebSocket events, and handles retryable vs permanent errors.
+   */
+  public async sendMessage(text: string): Promise<void> {
+    if (!this.session || !this.activeRoomId) {
+      throw new Error('Cannot send message: no active room or session');
+    }
+
+    const roomId = this.activeRoomId;
+    if (this.revokedRooms[roomId]) {
+      const err = `Cannot send message: access to room ${roomId} was revoked (${this.revokedRooms[roomId]})`;
+      this.addLog('error', err);
+      throw new Error(err);
+    }
+
+    const userId = this.session.user.user_id;
+
+    // 1. Text validation per Section 3
+    const validation = validateMessageText(text);
+    if (!validation.valid) {
+      const err = validation.reason || 'Invalid message text';
+      this.addLog('error', `Message validation error: ${err}`);
+      throw new Error(err);
+    }
+
+    // 2. Generate client_message_id (UUID v4)
+    const clientMessageId = generateUuid();
+
+    // 3. Record pending send before initiating HTTP request
+    const pendingItem: PendingMessage = {
+      user_id: userId,
+      room_id: roomId,
+      client_message_id: clientMessageId,
+      text,
+      created_at: new Date().toISOString(),
+      status: 'sending',
+      attempts: 1
+    };
+
+    const currentPending = this.pendingByRoom[roomId] || [];
+    this.pendingByRoom[roomId] = [...currentPending, pendingItem];
+    await savePendingSend(pendingItem);
+
+    this.addLog('http', `Sending message (ID: ${clientMessageId.slice(0, 8)}...)...`);
+
+    // 4. Synchronize HTTP client chaos flag
+    httpClient.simulateDropAfterSend = this.simulateTimeoutOnSend;
+    if (this.simulateTimeoutOnSend) {
+      this.simulatedDroppedIds.add(clientMessageId);
+    }
+
+    try {
+      const resp = await httpClient.sendMessageHttp(roomId, clientMessageId, text);
+      const confirmedMsg = resp.message;
+
+      this.addLog(
+        'http',
+        `Message confirmed! Seq: #${confirmedMsg.seq} (replayed: ${resp.replayed})`
+      );
+
+      // Reconcile and clean up pending send
+      await this.removePending(roomId, clientMessageId);
+
+      // Deduplicate and insert confirmed message
+      const existing = this.messagesByRoom[roomId] || [];
+      const updated = this.dedupAndSortMessages([...existing, confirmedMsg]);
+      this.messagesByRoom[roomId] = updated;
+
+      // Advance contiguous cursor if this message is next in line
+      const currentCursorBig = parseSeq(this.cursorByRoom[roomId] || '0');
+      const msgSeqBig = parseSeq(confirmedMsg.seq);
+      let newCursor = this.cursorByRoom[roomId] || '0';
+      if (msgSeqBig === currentCursorBig + 1n) {
+        newCursor = msgSeqBig.toString();
+        this.cursorByRoom[roomId] = newCursor;
+      }
+
+      await saveMessagesAndCursorAtomic(userId, roomId, updated, newCursor);
+    } catch (err) {
+      this.handleSendError(roomId, clientMessageId, err);
+      throw err;
+    }
+  }
+
+  /**
+   * Retries a pending message using the EXACT SAME client_message_id and text.
+   */
+  public async retryPendingMessage(clientMessageId: string): Promise<void> {
+    if (!this.session || !this.activeRoomId) return;
+
+    const roomId = this.activeRoomId;
+    if (this.revokedRooms[roomId]) {
+      this.addLog('error', `Cannot retry message: access to room ${roomId} was revoked`);
+      return;
+    }
+
+    const userId = this.session.user.user_id;
+    const pendingList = this.pendingByRoom[roomId] || [];
+    const item = pendingList.find((p) => p.client_message_id === clientMessageId);
+
+    if (!item) {
+      this.addLog('error', `Pending message ${clientMessageId} not found to retry`);
+      return;
+    }
+
+    item.status = 'sending';
+    item.attempts += 1;
+    item.error_code = undefined;
+    item.error_message = undefined;
+    this.pendingByRoom[roomId] = [...pendingList];
+    await savePendingSend(item);
+
+    this.addLog('http', `Retrying message with exact same ID (${clientMessageId.slice(0, 8)}...) attempt #${item.attempts}`);
+
+    this.simulatedDroppedIds.delete(clientMessageId);
+
+    try {
+      const resp = await httpClient.sendMessageHttp(roomId, clientMessageId, item.text, true);
+      const confirmedMsg = resp.message;
+
+      this.addLog(
+        'http',
+        `Retried message confirmed! Seq: #${confirmedMsg.seq} (replayed: ${resp.replayed})`
+      );
+
+      await this.removePending(roomId, clientMessageId);
+
+      const existing = this.messagesByRoom[roomId] || [];
+      const updated = this.dedupAndSortMessages([...existing, confirmedMsg]);
+      this.messagesByRoom[roomId] = updated;
+
+      const currentCursorBig = parseSeq(this.cursorByRoom[roomId] || '0');
+      const msgSeqBig = parseSeq(confirmedMsg.seq);
+      let newCursor = this.cursorByRoom[roomId] || '0';
+      if (msgSeqBig === currentCursorBig + 1n) {
+        newCursor = msgSeqBig.toString();
+        this.cursorByRoom[roomId] = newCursor;
+      }
+
+      await saveMessagesAndCursorAtomic(userId, roomId, updated, newCursor);
+    } catch (err) {
+      this.handleSendError(roomId, clientMessageId, err);
+    }
+  }
+
+  /**
+   * Edits and resends a pending message.
+   * Section 6 requirement: Editing text constitutes a NEW intent, so the old pending item
+   * is removed and a NEW client_message_id is generated.
+   */
+  public async editAndResendPendingMessage(oldClientMessageId: string, newText: string): Promise<void> {
+    if (!this.activeRoomId) return;
+    this.addLog('info', `Editing pending message ${oldClientMessageId.slice(0, 8)}... with new text and generating fresh ID.`);
+    await this.cancelPendingMessage(oldClientMessageId);
+    await this.sendMessage(newText);
+  }
+
+  /**
+   * Cancels and removes a pending message from the outbox.
+   */
+  public async cancelPendingMessage(clientMessageId: string): Promise<void> {
+    if (!this.activeRoomId) return;
+    await this.removePending(this.activeRoomId, clientMessageId);
+    this.addLog('info', `Cancelled pending message ${clientMessageId.slice(0, 8)}...`);
+  }
+
+  /**
+   * Fires count (default 20) concurrent HTTP POST requests with the EXACT SAME client_message_id
+   * to demonstrate backend idempotency and safety under parallel race conditions.
+   */
+  public async runConcurrentIdempotencyDemo(count = 20): Promise<{
+    total: number;
+    created201: number;
+    replayed200: number;
+    uniqueMessageIds: number;
+    seq: string;
+  }> {
+    if (!this.session || !this.activeRoomId) {
+      throw new Error('Must be logged in with an active room to run idempotency test');
+    }
+
+    const roomId = this.activeRoomId;
+    const testId = generateUuid();
+    const testText = `[Concurrent Idempotency Demo] 20 parallel requests at ${new Date().toLocaleTimeString()}`;
+
+    this.addLog(
+      'http',
+      `Launching ${count} concurrent POST requests with single client_message_id (${testId.slice(0, 8)})...`
+    );
+
+    const promises = Array.from({ length: count }, () =>
+      httpClient.sendMessageHttp(roomId, testId, testText, true)
+    );
+
+    const results = await Promise.all(promises);
+
+    let created201 = 0;
+    let replayed200 = 0;
+    const messageIds = new Set<string>();
+    let finalSeq = '';
+
+    for (const res of results) {
+      if (res.replayed) {
+        replayed200++;
+      } else {
+        created201++;
+      }
+      messageIds.add(res.message.message_id);
+      finalSeq = res.message.seq;
+    }
+
+    const report = {
+      total: count,
+      created201,
+      replayed200,
+      uniqueMessageIds: messageIds.size,
+      seq: finalSeq
+    };
+
+    this.addLog(
+      'info',
+      `Idempotency test completed: ${created201} created, ${replayed200} replayed. Unique message_ids: ${messageIds.size} (Seq: #${finalSeq}). Exactly 1 record committed!`
+    );
+
+    await this.syncRoom(roomId);
+
+    return report;
+  }
+
+  /**
+   * Demonstrates Idempotency Conflict (409 IDEMPOTENCY_CONFLICT).
+   * Sends first request with client_message_id, then sends a second request with the
+   * SAME client_message_id but DIFFERENT text, catching the 409 error.
+   */
+  public async simulateIdempotencyConflict409(): Promise<{
+    code: string;
+    status: number;
+    message: string;
+    clientMessageId: string;
+  }> {
+    if (!this.session || !this.activeRoomId) {
+      throw new Error('Must be logged in with an active room to test 409 conflict');
+    }
+
+    const roomId = this.activeRoomId;
+    const clientMessageId = generateUuid();
+    const originalText = 'Original text for 409 test';
+    const modifiedText = 'Modified text with same client_message_id';
+
+    this.addLog('http', `[409 Test] Sending 1st request with ID ${clientMessageId.slice(0, 8)}...`);
+    await httpClient.sendMessageHttp(roomId, clientMessageId, originalText, true);
+
+    this.addLog('http', `[409 Test] Sending 2nd request with SAME ID but MODIFIED text...`);
+    try {
+      await httpClient.sendMessageHttp(roomId, clientMessageId, modifiedText, true);
+      throw new Error('Expected 409 IDEMPOTENCY_CONFLICT, but request succeeded');
+    } catch (err) {
+      if (err instanceof ApiError) {
+        this.addLog('http', `[409 Test] Caught expected ${err.status} ${err.code}: ${err.message}`);
+        await this.syncRoom(roomId);
+        return {
+          code: err.code,
+          status: err.status,
+          message: err.message,
+          clientMessageId
+        };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Toggles or sets the server-side outbox transactional background worker pause state.
+   */
+  public async toggleOutboxWorker(paused?: boolean): Promise<void> {
+    const target = paused ?? !this.workerPaused;
+    this.addLog('http', `Setting outbox worker paused = ${target}...`);
+    const res = await httpClient.triggerDevChaos<{
+      worker_paused: boolean;
+      flushed_count: number;
+      outbox_backlog_count: number;
+    }>({ action: 'set_worker_paused', paused: target });
+
+    this.workerPaused = res.worker_paused;
+    this.outboxBacklogCount = res.outbox_backlog_count;
+    this.addLog(
+      'info',
+      `Outbox worker is now ${res.worker_paused ? 'PAUSED' : 'ACTIVE'} (Backlog: ${res.outbox_backlog_count}, Flushed: ${res.flushed_count})`
+    );
+  }
+
+  /**
+   * Refreshes the dev chaos status (worker pause state and outbox backlog count).
+   */
+  public async refreshDevChaosStatus(): Promise<void> {
+    try {
+      const res = await httpClient.triggerDevChaos<{
+        worker_paused: boolean;
+        outbox_backlog_count: number;
+      }>({ action: 'get_status' });
+      if (typeof res.worker_paused === 'boolean') {
+        this.workerPaused = res.worker_paused;
+      }
+      if (typeof res.outbox_backlog_count === 'number') {
+        this.outboxBacklogCount = res.outbox_backlog_count;
+      }
+    } catch (err) {
+      console.warn('Failed to refresh dev chaos status:', err);
+    }
+  }
+
+  /**
+   * Commits a message on the server without WebSocket broadcast to test recovery sync.
+   */
+  public async simulateSilentPeerMessage(): Promise<void> {
+    if (!this.activeRoomId) return;
+    this.addLog('http', `Simulating silent peer message in ${this.activeRoomId}...`);
+    await httpClient.triggerDevChaos({
+      action: 'simulate_silent_message',
+      room_id: this.activeRoomId
+    });
+    this.addLog(
+      'sync',
+      'Silent peer message committed on server without WebSocket broadcast. Waiting for periodic sync (15s) or manual sync to recover.'
+    );
+  }
+
+  /**
+   * Simulates duplicate WebSocket broadcast frames from server.
+   */
+  public async simulateDuplicateWsEvent(): Promise<void> {
+    if (!this.activeRoomId) return;
+    this.addLog('ws', `Simulating duplicate WebSocket frames for room ${this.activeRoomId}...`);
+    await httpClient.triggerDevChaos({
+      action: 'simulate_duplicate_ws',
+      room_id: this.activeRoomId
+    });
+    this.addLog('ws', 'Simulated 3 identical message.created frames sent from server.');
+  }
+
+  /**
+   * Simulates out-of-order WebSocket broadcast frames from server (#N+2 before #N+1).
+   */
+  public async simulateOutOfOrderWsEvent(): Promise<void> {
+    if (!this.activeRoomId) return;
+    this.addLog('ws', `Simulating out-of-order WebSocket frames for room ${this.activeRoomId}...`);
+    await httpClient.triggerDevChaos({
+      action: 'simulate_out_of_order_ws',
+      room_id: this.activeRoomId
+    });
+    this.addLog('ws', 'Simulated out-of-order events emitted (#N+2 sent before #N+1). Gap healing should trigger.');
+  }
+
+  /**
+   * Simulates membership revocation in the active room (e.g. member kicked).
+   */
+  public async simulateRemoveMember(silent = false): Promise<void> {
+    if (!this.activeRoomId) return;
+    this.addLog('http', `Simulating member removal (silent=${silent}) in room ${this.activeRoomId}...`);
+    await httpClient.triggerDevChaos({
+      action: 'remove_member',
+      room_id: this.activeRoomId,
+      silent
+    });
+    this.addLog('info', `Member removed from room ${this.activeRoomId} (silent: ${silent}).`);
+  }
+
+  /**
+   * Restores membership in the active room, clears revocation state, and resubscribes/syncs.
+   */
+  public async simulateRestoreMember(): Promise<void> {
+    if (!this.activeRoomId) return;
+    const roomId = this.activeRoomId;
+    this.addLog('http', `Restoring membership in room ${roomId}...`);
+    await httpClient.triggerDevChaos({
+      action: 'restore_member',
+      room_id: roomId
+    });
+    delete this.revokedRooms[roomId];
+    this.addLog('info', `Membership restored for room ${roomId}. Resubscribing and syncing...`);
+    await this.selectRoom(roomId);
+  }
+
+  /**
+   * Triggers a dev simulation of an incoming message from a peer user.
+   */
+  public async simulateIncomingFromPeer(): Promise<void> {
+    if (!this.activeRoomId) return;
+    this.addLog('http', 'Simulating incoming message from peer...');
+    await httpClient.triggerDevChaos({
+      action: 'simulate_incoming',
+      room_id: this.activeRoomId
+    });
+  }
+
+  /**
+   * Forces a simulated WebSocket disconnection with code 1001 or specified code via backend chaos endpoint.
+   */
+  public async simulateWsDisconnect(code = 1001): Promise<void> {
+    this.addLog('ws', `Simulating server WebSocket disconnect with close code ${code}...`);
+    try {
+      await httpClient.triggerDevChaos({
+        action: 'disconnect_ws',
+        code
+      });
+    } catch {
+      wsClient.forceDisconnect(4000);
+    }
+  }
+
+  /**
+   * Artificially sets local cursor backwards to create a sequence gap, then runs syncRoom
+   * to demonstrate contiguous gap detection and recovery.
+   */
+  public async simulateLocalGapAndSync(): Promise<void> {
+    if (!this.activeRoomId) return;
+    const roomId = this.activeRoomId;
+    const current = this.cursorByRoom[roomId] || '0';
+    const big = parseSeq(current);
+    const fakeCursor = big > 2n ? (big - 2n).toString() : '0';
+
+    this.cursorByRoom[roomId] = fakeCursor;
+    this.addLog('sync', `Artificially rolled back cursor from #${current} to #${fakeCursor} to create gap.`);
+    await this.syncRoom(roomId);
+  }
+
+  // ============================================================================
+  // Private Helpers & Event Wiring
+  // ============================================================================
+
+  private setupWsCallbacks(): void {
+    wsClient.setCallbacks({
+      onStateChange: (state, error, closeCode) => {
+        this.wsState = state;
+        this.wsError = error ?? null;
+        this.lastCloseCode = closeCode ?? null;
+        this.reconnectAttempt = wsClient.getReconnectAttempt();
+        this.addLog('ws', `WebSocket state changed to ${state}${closeCode ? ` (code: ${closeCode})` : ''}`);
+
+        // Gap F4: Repeated handshake failure -> verify session status via HTTP
+        if (state === 'reconnecting' && this.reconnectAttempt >= 2) {
+          this.verifySessionOnWsFailure();
+        }
+      },
+
+      onSubscribed: (roomId, lastSeq) => {
+        this.subscribedRooms[roomId] = true;
+        this.addLog('ws', `Subscribed to room ${roomId} (last_seq: #${lastSeq})`);
+      },
+
+      onUnsubscribed: (roomId) => {
+        this.subscribedRooms[roomId] = false;
+        this.addLog('ws', `Unsubscribed from room ${roomId}`);
+      },
+
+      onSubscriptionRevoked: (roomId, reason) => {
+        this.handleRoomRevoked(roomId, reason);
+      },
+
+      onProtocolAnomaly: (reason) => {
+        this.addLog('error', `[Protocol Anomaly] ${reason}`);
+      },
+
+      onMessageCreated: (roomId, message) => {
+        this.handleWsMessageCreated(roomId, message);
+      },
+
+      onError: (code, message) => {
+        this.addLog('error', `WebSocket error (${code}): ${message}`);
+      },
+
+      onAuthExpired: () => {
+        this.session = null;
+        this.addLog('error', 'Session expired via WebSocket. Please log in again.');
+      },
+
+      onReconnected: () => {
+        this.addLog('ws', 'WebSocket reconnected. Triggering sync for active room...');
+        if (this.activeRoomId) {
+          this.syncRoom(this.activeRoomId);
+        }
+      }
+    });
+  }
+
+  /**
+   * Handles room access revocation (Gap F2):
+   * Sets revoked status, unsubscribes, marks pending messages as permanent failure, and logs.
+   */
+  private handleRoomRevoked(roomId: string, reason = 'ACCESS_REVOKED'): void {
+    this.subscribedRooms[roomId] = false;
+    this.revokedRooms[roomId] = reason;
+    wsClient.unsubscribeRoom(roomId);
+
+    const pendingList = this.pendingByRoom[roomId] || [];
+    for (const item of pendingList) {
+      item.status = 'failed_permanent';
+      item.error_code = 'ROOM_NOT_FOUND';
+      item.error_message = `Room access revoked (${reason})`;
+      savePendingSend(item).catch((e) => console.error('Failed to update revoked pending in IDB:', e));
+    }
+    this.pendingByRoom[roomId] = [...pendingList];
+
+    this.addLog('error', `Access to room ${roomId} revoked (${reason}). Stopped tracking and sending.`);
+  }
+
+  /**
+   * Gap F4: Verifies authentication session when WebSocket repeatedly fails to reconnect.
+   */
+  private async verifySessionOnWsFailure(): Promise<void> {
+    try {
+      await httpClient.fetchSession();
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 401 || err.code === 'UNAUTHENTICATED')) {
+        this.addLog('error', 'Session expired during WebSocket reconnect — stopping retries');
+        wsClient.disconnect();
+        this.session = null;
+      }
+    }
+  }
+
+  private handleWsMessageCreated(roomId: string, message: Message): void {
+    if (message.client_message_id && this.simulatedDroppedIds.has(message.client_message_id)) {
+      this.addLog(
+        'ws',
+        `[Chaos Mode] Suppressed live WS frame for ${message.client_message_id.slice(0, 8)}... to simulate dropped network packet during send`
+      );
+      return;
+    }
+    this.addLog('ws', `Received live message.created in ${roomId} (Seq: #${message.seq})`);
+
+    // 1. Reconcile with pending sends
+    const userId = this.session?.user.user_id;
+    if (userId && message.sender.user_id === userId && message.client_message_id) {
+      this.removePending(roomId, message.client_message_id);
+    }
+
+    // 2. Buffer if currently performing recovery sync OR awaiting subscribe confirmation (Gap F1)
+    if (this.syncingByRoom[roomId] || this.bufferingRoomIds[roomId]) {
+      this.liveBuffer[roomId] = this.liveBuffer[roomId] || [];
+      if (this.liveBuffer[roomId].length >= 500) {
+        this.addLog(
+          'error',
+          'Live event buffer reached 500 events limit! Restarting connection and fresh recovery sync.'
+        );
+        this.liveBuffer[roomId] = [];
+        this.bufferingRoomIds[roomId] = false;
+        wsClient.forceDisconnect(1001);
+        return;
+      }
+      this.liveBuffer[roomId].push(message);
+      return;
+    }
+
+    // 3. Deduplicate and add to messages
+    const existing = this.messagesByRoom[roomId] || [];
+    const updated = this.dedupAndSortMessages([...existing, message]);
+    this.messagesByRoom[roomId] = updated;
+
+    // 4. Advance contiguous cursor if message matches cursor + 1n
+    const currentCursor = this.cursorByRoom[roomId] || '0';
+    const currentCursorBig = parseSeq(currentCursor);
+    const msgSeqBig = parseSeq(message.seq);
+    let newCursor = currentCursor;
+
+    if (msgSeqBig === currentCursorBig + 1n) {
+      newCursor = msgSeqBig.toString();
+      this.cursorByRoom[roomId] = newCursor;
+    } else if (msgSeqBig > currentCursorBig + 1n) {
+      // Missing intermediate sequence detected: trigger background sync to heal gap!
+      this.addLog('sync', `Detected sequence gap (Cursor: #${currentCursor}, Message: #${message.seq}). Scheduling sync...`);
+      this.syncRoom(roomId);
+    }
+
+    if (userId) {
+      saveMessagesAndCursorAtomic(userId, roomId, updated, newCursor).catch((err) => {
+        console.error('Failed to save live message to IDB:', err);
+      });
+    }
+  }
+
+  private async onLoginSuccess(): Promise<void> {
+    if (!this.session) return;
+    const userId = this.session.user.user_id;
+
+    // Connect WebSocket
+    wsClient.connect();
+
+    // Fetch rooms (Gap F9: track next_cursor)
+    try {
+      const resp = await httpClient.fetchRooms(50);
+      this.rooms = resp.items || [];
+      this.roomsNextCursor = resp.next_cursor ?? null;
+      this.addLog('http', `Loaded ${this.rooms.length} chat rooms`);
+    } catch (err) {
+      this.addLog('error', `Failed to load rooms: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Load any pending sends from previous sessions from IDB (Gap F5)
+    try {
+      const allPending = await getAllPendingForUser(userId);
+      const grouped: Record<string, PendingMessage[]> = {};
+      for (const p of allPending) {
+        if (p.status === 'sending' || p.status === 'pending') {
+          p.status = 'failed_retryable';
+          p.error_code = 'RELOAD_INTERRUPTED';
+          p.error_message = 'โหลดหน้าใหม่ระหว่างรอผล — กดส่งซ้ำด้วยรหัสเดิม';
+          await savePendingSend(p);
+        }
+        grouped[p.room_id] = grouped[p.room_id] || [];
+        grouped[p.room_id].push(p);
+      }
+      this.pendingByRoom = grouped;
+      if (allPending.length > 0) {
+        this.addLog('info', `Restored ${allPending.length} pending outbox messages from local storage.`);
+      }
+    } catch (err) {
+      console.warn('Failed to load pending sends from storage:', err);
+    }
+
+    // Refresh dev chaos status
+    await this.refreshDevChaosStatus();
+
+    // Start periodic 15s background sync
+    this.startPeriodicSync();
+
+    // Select first room if available
+    if (this.rooms.length > 0 && !this.activeRoomId) {
+      await this.selectRoom(this.rooms[0].room_id);
+    }
+  }
+
+  private startPeriodicSync(): void {
+    this.stopPeriodicSync();
+    this.periodicSyncTimer = setInterval(() => {
+      if (document.visibilityState === 'visible' && this.activeRoomId && this.session) {
+        this.syncRoom(this.activeRoomId);
+      }
+    }, 15000);
+  }
+
+  private stopPeriodicSync(): void {
+    if (this.periodicSyncTimer) {
+      clearInterval(this.periodicSyncTimer);
+      this.periodicSyncTimer = null;
+    }
+  }
+
+  private setupVisibilityListener(): void {
+    if (this.isVisibilityListenerAttached || typeof document === 'undefined') return;
+    this.isVisibilityListenerAttached = true;
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && this.activeRoomId && this.session) {
+        this.addLog('sync', 'App tab became visible. Running immediate catch-up sync...');
+        this.syncRoom(this.activeRoomId);
+      }
+    });
+  }
+
+  private handleSendError(roomId: string, clientMessageId: string, err: unknown): void {
+    const pendingList = this.pendingByRoom[roomId] || [];
+    const item = pendingList.find((p) => p.client_message_id === clientMessageId);
+    if (!item) return;
+
+    let retryable = true;
+    let code = 'NETWORK_ERROR';
+    let message = err instanceof Error ? err.message : 'Send failed';
+
+    if (err instanceof ApiError) {
+      retryable = err.retryable;
+      code = err.code;
+      message = err.message;
+      if (err.status === 404 || err.code === 'ROOM_NOT_FOUND') {
+        this.handleRoomRevoked(roomId, 'ROOM_NOT_FOUND');
+      }
+    }
+
+    item.status = retryable ? 'failed_retryable' : 'failed_permanent';
+    item.error_code = code;
+    item.error_message = message;
+    this.pendingByRoom[roomId] = [...pendingList];
+
+    savePendingSend(item).catch((e) => console.error('Failed to update pending error in IDB:', e));
+    this.addLog('error', `Send failed for ${clientMessageId.slice(0, 8)}... (${code}): ${message}`);
+  }
+
+  private async removePending(roomId: string, clientMessageId: string): Promise<void> {
+    const list = this.pendingByRoom[roomId] || [];
+    this.pendingByRoom[roomId] = list.filter((p) => p.client_message_id !== clientMessageId);
+    if (this.session) {
+      await removePendingSend(this.session.user.user_id, roomId, clientMessageId);
+    }
+  }
+
+  private async reconcilePendingSends(roomId: string, confirmedMessages: Message[]): Promise<void> {
+    const pendingList = this.pendingByRoom[roomId] || [];
+    if (pendingList.length === 0) return;
+
+    const confirmedIds = new Set(confirmedMessages.map((m) => m.client_message_id).filter(Boolean));
+    const remaining: PendingMessage[] = [];
+
+    for (const pending of pendingList) {
+      if (confirmedIds.has(pending.client_message_id)) {
+        if (this.session) {
+          await removePendingSend(this.session.user.user_id, roomId, pending.client_message_id);
+        }
+      } else {
+        remaining.push(pending);
+      }
+    }
+
+    this.pendingByRoom[roomId] = remaining;
+  }
+
+  private dedupAndSortMessages(messages: Message[]): Message[] {
+    const map = new Map<string, Message>();
+    for (const msg of messages) {
+      map.set(msg.message_id, msg);
+    }
+    const list = Array.from(map.values());
+    list.sort((a, b) => compareSeq(a.seq, b.seq));
+    return list;
+  }
+}
+
+export const chatEngine = new ChatEngine();

@@ -1,0 +1,221 @@
+/* ============================================================================
+   Messenger-Style Modern CSS Styling
+   Adheres to Modern Web Guidance:
+   - dark-mode & dark-mode-toggle
+   - form-fields-automatically-fit-contents (field-sizing: content)
+   - light-dismiss-a-dialog (native <dialog closedby="any"> + backdrop)
+   ============================================================================ */
+
+/* 1. Global Color Scheme with Meta Tag Reflection */
+:root {
+  color-scheme: light dark;
+
+  &:has(> head > meta[name="color-scheme"][content="dark"]) {
+    color-scheme: dark;
+  }
+  &:has(> head > meta[name="color-scheme"][content="light"]) {
+    color-scheme: light;
+  }
+
+  /* Messenger Color Palette Tokens */
+  --bg-app-light: #f0f2f5;
+  --bg-app-dark: #18191a;
+
+  --bg-surface-light: #ffffff;
+  --bg-surface-dark: #242526;
+
+  --bg-sidebar-light: #ffffff;
+  --bg-sidebar-dark: #1c1e21;
+
+  --bg-input-light: #f0f2f5;
+  --bg-input-dark: #3a3b3c;
+
+  --border-light: #e4e6eb;
+  --border-dark: #3a3b3c;
+
+  --text-primary-light: #050505;
+  --text-primary-dark: #e4e6eb;
+
+  --text-secondary-light: #65676b;
+  --text-secondary-dark: #b0b3b8;
+
+  --text-tertiary-light: #8a8d91;
+  --text-tertiary-dark: #8a8d91;
+
+  --bubble-in-bg-light: #e4e6eb;
+  --bubble-in-bg-dark: #3a3b3c;
+
+  --bubble-in-text-light: #050505;
+  --bubble-in-text-dark: #e4e6eb;
+
+  --item-hover-light: #f2f2f2;
+  --item-hover-dark: #303031;
+
+  --item-active-light: #e7f3ff;
+  --item-active-dark: #263951;
+
+  --scrollbar-thumb-light: #bcc0c4;
+  --scrollbar-thumb-dark: #4e4f50;
+
+  /* Universal Brand Tokens */
+  --brand-blue: #0084ff;
+  --brand-blue-hover: #0073e6;
+  --brand-gradient: linear-gradient(135deg, #0084ff 0%, #0099ff 50%, #a033ff 100%);
+  --bubble-out-text: #ffffff;
+
+  --status-green: #31a24c;
+  --status-yellow: #f5a623;
+  --status-red: #fa383e;
+
+  /* Fallback assignments for older browsers */
+  --bg-app: var(--bg-app-light);
+  --bg-surface: var(--bg-surface-light);
+  --bg-sidebar: var(--bg-sidebar-light);
+  --bg-input: var(--bg-input-light);
+  --border: var(--border-light);
+  --text-primary: var(--text-primary-light);
+  --text-secondary: var(--text-secondary-light);
+  --text-tertiary: var(--text-tertiary-light);
+  --bubble-in-bg: var(--bubble-in-bg-light);
+  --bubble-in-text: var(--bubble-in-text-light);
+  --item-hover: var(--item-hover-light);
+  --item-active: var(--item-active-light);
+  --scrollbar-thumb: var(--scrollbar-thumb-light);
+
+  @media (prefers-color-scheme: dark) {
+    --bg-app: var(--bg-app-dark);
+    --bg-surface: var(--bg-surface-dark);
+    --bg-sidebar: var(--bg-sidebar-dark);
+    --bg-input: var(--bg-input-dark);
+    --border: var(--border-dark);
+    --text-primary: var(--text-primary-dark);
+    --text-secondary: var(--text-secondary-dark);
+    --text-tertiary: var(--text-tertiary-dark);
+    --bubble-in-bg: var(--bubble-in-bg-dark);
+    --bubble-in-text: var(--bubble-in-text-dark);
+    --item-hover: var(--item-hover-dark);
+    --item-active: var(--item-active-dark);
+    --scrollbar-thumb: var(--scrollbar-thumb-dark);
+  }
+
+  @supports (color: light-dark(white, black)) {
+    --bg-app: light-dark(var(--bg-app-light), var(--bg-app-dark));
+    --bg-surface: light-dark(var(--bg-surface-light), var(--bg-surface-dark));
+    --bg-sidebar: light-dark(var(--bg-sidebar-light), var(--bg-sidebar-dark));
+    --bg-input: light-dark(var(--bg-input-light), var(--bg-input-dark));
+    --border: light-dark(var(--border-light), var(--border-dark));
+    --text-primary: light-dark(var(--text-primary-light), var(--text-primary-dark));
+    --text-secondary: light-dark(var(--text-secondary-light), var(--text-secondary-dark));
+    --text-tertiary: light-dark(var(--text-tertiary-light), var(--text-tertiary-dark));
+    --bubble-in-bg: light-dark(var(--bubble-in-bg-light), var(--bubble-in-bg-dark));
+    --bubble-in-text: light-dark(var(--bubble-in-text-light), var(--bubble-in-text-dark));
+    --item-hover: light-dark(var(--item-hover-light), var(--item-hover-dark));
+    --item-active: light-dark(var(--item-active-light), var(--item-active-dark));
+    --scrollbar-thumb: light-dark(var(--scrollbar-thumb-light), var(--scrollbar-thumb-dark));
+  }
+
+  /* Standard Overlay Scrollbars */
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+/* Legacy Scrollbar Fallback for WebKit without scrollbar-color */
+@supports not (scrollbar-color: auto) {
+  *::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 9999px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/* 2. Global Resets & Typography */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  background-color: var(--bg-app);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  height: 100%;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 3. Auto-Growing Composer Textarea */
+.composer-textarea {
+  field-sizing: content;
+  height: auto;
+  width: 100%;
+  min-block-size: 1.5lh;
+  max-block-size: 8lh;
+  align-self: start;
+  resize: none;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--text-primary);
+  padding: 8px 12px;
+}
+
+.composer-textarea::placeholder {
+  color: var(--text-secondary);
+}
+
+@supports not (field-sizing: content) {
+  .composer-textarea {
+    min-height: 38px;
+    max-height: 160px;
+    resize: vertical;
+  }
+}
+
+/* 4. Native Dialog & Modal Backdrop */
+dialog {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background-color: var(--bg-surface);
+  color: var(--text-primary);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.28);
+  padding: 0;
+  max-width: 520px;
+  width: 90vw;
+  margin: auto;
+}
+
+dialog::backdrop {
+  background-color: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(4px);
+}
+
+/* Animations */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spin-icon {
+  animation: spin 1s linear infinite;
+  display: inline-block;
+}
